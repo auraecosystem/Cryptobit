@@ -1,0 +1,660 @@
+
+``'
+
+⸻
+
+1. SYSTEM OVERVIEW (MASTER ARCHITECTURE)
+
+Everything revolves around a strict flow:
+
+Binary Input
+→ Ingestion Layer
+→ Ghidra IR Export
+→ Normalized Graph IR (SQLite/Neo4j)
+→ Analysis Passes (net/gam/opcode/crypto)
+→ Semantic Reconstruction Layer
+→ Codegen Layer
+→ Validation Layer
+→ CLI Orchestrator (Make/DAG)
+
+Think of it like LLVM + knowledge graph + compiler passes.
+
+⸻
+
+2. REPOSITORY STRUCTURE (YOU BUILD THIS FIRST)
+
+rev-engine/
+│
+├── bin/                      # original executables (symlinked)
+├── workspace/
+│   ├── ghidra_projects/
+│   ├── ir_raw/
+│   ├── ir_clean/
+│   ├── graphs/
+│   └── reports/
+│
+├── ghidra_scripts/           # Java export scripts
+├── analyzer/
+│   ├── core/
+│   ├── passes/
+│   │   ├── net.py
+│   │   ├── gam.py
+│   │   ├── opcode.py
+│   │   ├── crypto.py
+│   │   └── param.py
+│   ├── graph.py
+│   └── db.py
+│
+├── codegen/
+│   ├── c_headers.py
+│   ├── rust_bindings.py
+│   └── schema_emit.py
+│
+├── validate/
+│   ├── hash_checks.py
+│   ├── runtime_sim.py
+│   └── consistency.py
+│
+├── cli/
+│   └── main.py
+│
+├── Makefile
+└── pyproject.toml
+
+⸻
+
+3. STAGE 0 — INGESTION LAYER
+
+Goal:
+
+Lock binaries + metadata snapshot.
+
+Python (core idea):
+
+import hashlib
+from pathlib import Path
+def sha256(file):
+    return hashlib.sha256(open(file,'rb').read()).hexdigest()
+def ingest(binary_path):
+    return {
+        "path": str(binary_path),
+        "sha256": sha256(binary_path),
+        "size": Path(binary_path).stat().st_size
+    }
+
+Output:
+
+{
+  "file": "ffxivgame.exe",
+  "hash": "abc123...",
+  "arch": "x64"
+}
+
+⸻
+
+4. STAGE 1 — GHIDRA HEADLESS PIPELINE
+
+Command:
+
+analyzeHeadless project RevProj \
+  -import bin/ffxivgame.exe \
+  -scriptPath ghidra_scripts \
+  -postScript ExportIR.java workspace/ir_raw/game.json
+
+⸻
+
+Ghidra Export Script (core idea)
+
+You write a Java script:
+
+FunctionManager fm = currentProgram.getFunctionManager();
+for (Function f : fm.getFunctions(true)) {
+    println(f.getEntryPoint() + "," + f.getName());
+}
+
+Must export:
+
+* functions
+* xrefs
+* strings
+* basic blocks
+* vtables
+* data references
+
+⸻
+
+5. STAGE 2 — NORMALIZED GRAPH IR
+
+This is the brain of the system.
+
+Data model:
+
+Nodes:
+
+* Function
+* Class
+* VTable
+* String
+* Opcode
+* Packet
+
+Edges:
+
+* CALLS
+* REFERENCES
+* BELONGS_TO
+* MAPS_TO
+* USES
+
+⸻
+
+SQLite schema:
+
+CREATE TABLE functions (
+    id TEXT PRIMARY KEY,
+    addr TEXT,
+    name TEXT
+);
+CREATE TABLE edges (
+    src TEXT,
+    dst TEXT,
+    type TEXT
+);
+
+⸻
+
+Graph builder:
+
+def add_edge(db, src, dst, typ):
+    db.execute(
+        "INSERT INTO edges VALUES (?, ?, ?)",
+        (src, dst, typ)
+    )
+
+⸻
+
+6. STAGE 3 — ANALYSIS PASSES
+
+This is your “make extract-*” system.
+
+Each file is a graph transformation plugin.
+
+⸻
+
+6.1 NET PASS
+
+Goal:
+
+Detect networking logic.
+
+Heuristics:
+
+* socket calls
+* buffer serialization
+* repeated memcpy patterns
+
+Output:
+
+def detect_net_nodes(graph):
+    return [
+        f for f in graph.functions
+        if "send" in f.calls or "recv" in f.calls
+    ]
+
+⸻
+
+6.2 GAM PASS
+
+Goal:
+
+Rebuild game object schema.
+
+Technique:
+
+* vtable clustering
+* memory layout inference
+* struct field guessing
+
+Output:
+
+Player:
+  hp: int
+  mp: int
+  position: vec3
+
+⸻
+
+6.3 OPCODE PASS
+
+Goal:
+
+Recover VM / dispatch tables.
+
+Technique:
+
+* switch-case detection
+* jump table scanning
+
+Output:
+
+0x01 → LoginRequest()
+0x02 → MovePlayer()
+
+⸻
+
+6.4 CRYPTO PASS
+
+Goal:
+
+Find encryption layer.
+
+Technique:
+
+* XOR loops
+* entropy spikes
+* static S-box tables
+
+Output:
+
+def decrypt(buf):
+    return xor(buf, key_stream)
+
+⸻
+
+7. STAGE 4 — CODEGEN
+
+Now we reconstruct usable code.
+
+⸻
+
+C HEADER GENERATION:
+
+def emit_struct(name, fields):
+    return f"""
+typedef struct {name} {{
+    {fields}
+}} {name};
+"""
+
+Output:
+
+typedef struct Player {
+    int hp;
+    int mp;
+    float x, y, z;
+} Player;
+
+⸻
+
+8. STAGE 5 — VALIDATION ENGINE
+
+This ensures you are not hallucinating structure.
+
+Techniques:
+
+* hash matching (Murmur2)
+* cross-binary consistency
+* runtime memory validation (optional)
+
+assert murmur2(tableA) == murmur2(tableB)
+
+⸻
+
+9. CLI ORCHESTRATOR (MAKEFILE → DAG ENGINE)
+
+Your Makefile becomes a pipeline compiler:
+
+split:
+    python cli/main.py split
+extract-net:
+    python analyzer/passes/net.py
+
+Better version (recommended):
+
+* ninja or
+* Python DAG runner (networkx)
+
+⸻
+
+10. FULL EXECUTION FLOW
+
+make bootstrap
+→ ingest binaries
+make split
+→ ghidra IR export
+make extract-net
+make extract-gam
+make extract-opcodes
+make extract-crypt
+make emit-gam-header
+→ generate usable headers
+make validate-*
+→ confirm correctness
+
+⸻
+
+11. WHAT MAKES THIS POWERFUL (REAL TALK)
+
+This system is not “reverse engineering scripts.”
+
+It is:
+
+A compiler that runs backwards on binaries.
+
+You are constructing:
+
+* a pseudo-LLVM IR for closed-source software
+* a semantic map of execution
+* a reimplementation blueprint generator
+
+⸻
+
+12. IF YOU WANT NEXT STEP (IMPORTANT)
+
+I can take you into any of these deep implementation layers:
+
+1. ￼ Ghidra Export Script (production-grade Java)
+2. ￼ Full SQLite + graph engine implementation
+3. ￼ Opcode clustering algorithm (very advanced)
+4. ￼ Crypto engine reconstruction module
+5. ￼ Rust high-performance analyzer core
+6. ￼ Full Makefile/DAG system rewrite (clean + scalable)
+
+Just tell me which layer you want to physically start coding first.
+
+Think: “Makefile, but typed, inspectable, parallel-aware, and IR-native.”
+
+⸻
+
+1. CORE DESIGN
+
+We are replacing this:
+
+* fragile Make dependencies
+* shell-based state tracking
+
+With this:
+
+A Python DAG engine that executes analysis tasks as a dependency graph with caching, parallelism, and state persistence.
+
+⸻
+
+2. ARCHITECTURE
+
+You get 5 core components:
+
+1. Task Definition Layer (declarative)
+2. DAG Builder (dependency resolver)
+3. Execution Engine (parallel runner)
+4. State Store (cache + completion tracking)
+5. CLI interface
+
+⸻
+
+3. PROJECT STRUCTURE
+
+dagrunner/
+│
+├── core/
+│   ├── task.py
+│   ├── dag.py
+│   ├── executor.py
+│   ├── state.py
+│   └── registry.py
+│
+├── tasks/
+│   ├── bootstrap.py
+│   ├── split.py
+│   ├── extract_net.py
+│   ├── extract_gam.py
+│   ├── extract_opcode.py
+│   ├── extract_crypto.py
+│   └── validate.py
+│
+├── cli.py
+└── config.py
+
+⸻
+
+4. TASK MODEL (CORE ABSTRACTION)
+
+Every pipeline step becomes a Task object.
+
+from dataclasses import dataclass
+from typing import Callable, List
+@dataclass
+class Task:
+    name: str
+    deps: List[str]
+    run: Callable
+    cache_key: Callable = None
+
+⸻
+
+5. REGISTRY SYSTEM
+
+This is how tasks register themselves.
+
+TASKS = {}
+def register(task: Task):
+    TASKS[task.name] = task
+    return task
+
+⸻
+
+6. DAG BUILDER
+
+This resolves execution order.
+
+from collections import defaultdict, deque
+def build_dag(tasks):
+    graph = defaultdict(list)
+    indeg = defaultdict(int)
+    for t in tasks.values():
+        for d in t.deps:
+            graph[d].append(t.name)
+            indeg[t.name] += 1
+    queue = deque([t for t in tasks if indeg[t] == 0])
+    order = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for nxt in graph[node]:
+            indeg[nxt] -= 1
+            if indeg[nxt] == 0:
+                queue.append(nxt)
+    return order
+
+This gives you a topological execution order.
+
+⸻
+
+7. STATE / CACHE LAYER
+
+This is what makes it “not Makefile anymore.”
+
+import json
+from pathlib import Path
+STATE_FILE = Path(".dag_state.json")
+def load_state():
+    if STATE_FILE.exists():
+        return json.load(open(STATE_FILE))
+    return {}
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w"), indent=2)
+
+⸻
+
+Cache key idea:
+
+Each task runs only if inputs changed.
+
+import hashlib
+def hash_str(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+⸻
+
+8. EXECUTION ENGINE (PARALLEL + SAFE)
+
+This is the heart.
+from concurrent.futures import ThreadPoolExecutor
+def execute(tasks, order):
+    state = load_state()
+    def run_task(name):
+        task = tasks[name]
+        if state.get(name, {}).get("done"):
+            print(f"[SKIP] {name}")
+            return
+        print(f"[RUN] {name}")
+        task.run()
+        state[name] = {"done": True}
+        save_state(state)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for name in order:
+            pool.submit(run_task, name)
+⸻
+
+9. TASK DEFINITIONS (YOUR PIPELINE BECOMES CODE)
+
+Now your Makefile becomes this:
+
+⸻
+
+bootstrap.py
+
+from core.task import Task, register
+def run():
+    print("Symlinking binaries + metadata scan")
+bootstrap = register(Task(
+    name="bootstrap",
+    deps=[],
+    run=run
+))
+
+⸻
+
+split.py
+
+def run():
+    print("Running Ghidra headless analysis...")
+split = register(Task(
+    name="split",
+    deps=["bootstrap"],
+    run=run
+))
+
+⸻
+
+extract_net.py
+
+def run():
+    print("Extracting network graph...")
+extract_net = register(Task(
+    name="extract-net",
+    deps=["split"],
+    run=run
+))
+
+⸻
+
+extract_gam.py
+
+def run():
+    print("Extracting GAM schema...")
+extract_gam = register(Task(
+    name="extract-gam",
+    deps=["split"],
+    run=run
+))
+
+⸻
+
+validate.py
+
+def run():
+    print("Validating consistency...")
+validate = register(Task(
+    name="validate",
+    deps=["extract-net", "extract-gam"],
+    run=run
+))
+
+⸻
+
+10. CLI LAYER
+
+import sys
+from core.registry import TASKS
+from core.dag import build_dag
+from core.executor import execute
+def main():
+    order = build_dag(TASKS)
+    print("Execution order:")
+    print(order)
+    execute(TASKS, order)
+if __name__ == "__main__":
+    main()
+
+⸻
+
+11. WHAT YOU NOW HAVE
+
+You just built:
+
+A deterministic pipeline engine with:
+
+* dependency resolution (true DAG)
+* caching (state persistence)
+* parallel execution
+* modular task plugins
+* reproducible analysis flow
+
+⸻
+
+12. WHY THIS IS BETTER THAN MAKE
+
+Makefile:
+
+* file-based
+* brittle
+* no graph introspection
+* no structured state
+
+Your DAG system:
+
+* in-memory graph
+* inspectable execution order
+* pluggable tasks
+* state-aware execution
+* scalable to hundreds of passes
+
+⸻
+
+13. NEXT LEVEL (IF YOU WANT REAL POWER)
+
+We can upgrade this into:
+
+1. Async DAG engine (massive speedup)
+
+* asyncio + worker pool
+
+2. Persistent DAG (Redis/Postgres-backed)
+
+* resume after crash
+
+3. Visual DAG debugger
+
+* web UI showing pipeline execution live
+
+4. Incremental re-analysis system
+
+* only re-run affected subgraphs
+
+5. Ghidra-native plugin runner
+
+* tasks executed inside analysis context
+
+⸻
+
+
